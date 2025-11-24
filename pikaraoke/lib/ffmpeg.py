@@ -19,6 +19,8 @@ def build_ffmpeg_cmd(
     buffer_fully_before_playback=False,
     avsync=0,
     cdg_pixel_scaling=False,
+    original_sound=True,
+    original_sound_volume=40,
 ):
     avsync = float(avsync)
     # use h/w acceleration on pi
@@ -28,27 +30,62 @@ def build_ffmpeg_cmd(
     vcodec = (
         "copy" if fr.file_extension == ".mp4" or fr.file_extension == ".webm" else default_vcodec
     )
-    vbitrate = "5M"  # seems to yield best results w/ h264_v4l2m2m on pi, recommended for 720p.
+    vbitrate = "15M"  # seems to yield best results w/ h264_v4l2m2m on pi, recommended for 720p.
 
-    # copy the audio stream if no transposition/normalization, otherwise reincode with the aac codec
+    # copy the audio stream if no transposition/normalization/mixing, otherwise re-encode with aac
     is_transposed = semitones != 0
-    acodec = "aac" if is_transposed or normalize_audio or avsync != 0 else "copy"
+    acodec = "aac" if is_transposed or normalize_audio or avsync != 0 or original_sound else "copy"
 
     input = ffmpeg.input(fr.file_path)
-    audio = input.audio
 
-    # If avsync is set, delay or trim the audio stream
-    if avsync > 0:
-        audio = audio.filter("adelay", f"{avsync * 1000}|{avsync * 1000}")  # delay
-    elif avsync < 0:
-        audio = audio.filter("atrim", start=-avsync)  # trim
+    # Prefer explicit stream selection: use audio stream 0 as the "original" (contains vocals)
+    # and audio stream 1 as the "processed/instrumental" (no vocals). If a:1 isn't present,
+    # fall back to the single-audio-stream behavior.
+    try:
+        orig_audio = input["a:0"]
+        proc_audio = input["a:1"]
+    except Exception:
+        orig_audio = input.audio
+        proc_audio = input.audio
 
-    # The pitch value is (2^x/12), where x represents the number of semitones
-    pitch = 2 ** (semitones / 12)
+    # Decide whether we actually need to process the proc audio stream.
+    is_transposed = semitones != 0
+    needs_processing = is_transposed or normalize_audio or avsync != 0
 
-    audio = audio.filter("rubberband", pitch=pitch) if is_transposed else audio
-    # normalize the audio
-    audio = audio.filter("loudnorm", i=-16, tp=-1.5, lra=11) if normalize_audio else audio
+    # If no processing is required and the user does NOT want the original mixed back in,
+    # just use the processed track (a:1 when present) as-is -- avoids creating filter_graphs.
+    if not needs_processing and not original_sound:
+        audio = proc_audio
+    else:
+        # If avsync is set, delay or trim both audio streams equally
+        if avsync > 0:
+            delay_ms = int(avsync * 1000)
+            proc_audio = proc_audio.filter("adelay", f"{delay_ms}|{delay_ms}")
+            orig_audio = orig_audio.filter("adelay", f"{delay_ms}|{delay_ms}")
+        elif avsync < 0:
+            proc_audio = proc_audio.filter("atrim", start=-avsync)
+            orig_audio = orig_audio.filter("atrim", start=-avsync)
+
+        # The pitch value is (2^x/12), where x represents the number of semitones
+        pitch = 2 ** (semitones / 12)
+
+        # Apply processing only to the proc_audio stream
+        proc_audio = proc_audio.filter("rubberband", pitch=pitch) if is_transposed else proc_audio
+        proc_audio = proc_audio.filter("loudnorm", i=-16, tp=-1.5, lra=11) if normalize_audio else proc_audio
+
+        # If original sound requested, scale track 0 (a:0) and mix it with the proc track (a:1)
+        if original_sound:
+            try:
+                vol = float(original_sound_volume) / 100.0
+            except Exception:
+                vol = 0.5
+            scaled_orig = orig_audio.filter("volume", f"{vol}")
+            # Use amix to mix processed audio and scaled original (two inputs)
+            audio = ffmpeg.filter([proc_audio, scaled_orig], "amix", inputs=2, dropout_transition=0)
+            logging.info(f"Including original sound (track 0) at {vol*100}% volume in mix")
+        else:
+            # No original mixing requested but we reached here because processing was required.
+            audio = proc_audio
 
     # frag_keyframe+default_base_moof is used to set the correct headers for streaming incomplete files,
     # without it, there's better compatibility for streaming on certain browsers like Firefox
@@ -95,7 +132,7 @@ def build_ffmpeg_cmd(
         )
 
     args = output.get_args()
-    logging.debug(f"COMMAND: ffmpeg " + " ".join(args))
+    logging.info(f"COMMAND: ffmpeg " + " ".join(args))
     return output
 
 

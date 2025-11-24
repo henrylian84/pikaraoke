@@ -29,6 +29,7 @@ ffmpeg-python = "0.2.0"
 yt-dlp = ">=2025.10.14"
 flask-socketio = "^5.5.0"
 gevent = "^24.11.1"
+watchdog = "^4.0.1"
 
 [tool.poetry.scripts]
 pikaraoke = "pikaraoke.app:main"
